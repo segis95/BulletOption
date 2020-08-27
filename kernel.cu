@@ -1,215 +1,511 @@
-
-#include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include <fstream>
 #include <stdio.h>
 #include <iostream>
+#include <math.h>
 
 
-
-cudaError_t thomasWithCuda(double *Zs, double *As, double *Bs, double *Cs, double *Ys, int *lengths, int *starts,  int N, int size);
-
-
-
-__global__ void thomasKernel(double *Zs, double *As, double *Bs, double *Cs, double *Ys, int *lengths, int *starts){
-
-	int t_idx = threadIdx.x;
-	int M = lengths[t_idx];
-	double *a = &As[starts[t_idx] - t_idx];
-	double *b = &Bs[starts[t_idx]];
-	double *c = &Cs[starts[t_idx] - t_idx];
-	double *y = &Ys[starts[t_idx]];
-	double *z = &Zs[starts[t_idx]];
-
-	c[0] = c[0] / b[0];
-	y[0] = y[0] / b[0];
+#define L 1000 //time step number
+#define M 10 // payment date number
+#define N 50 // space step number; check the line 27 too!!
 
 
-	for (int i = 1; i < M - 1; i++){
-		c[i] = c[i] / (b[i] - a[i - 1] * c[i - 1]);	
-	}
+// precision to compare with
+__constant__  float err_r = 1e-4;
 
-	for (int i = 1; i < M ; i++){
-		y[i] = (y[i] - a[i - 1] * y[i - 1]) / (b[i] - a[i - 1] * c[i - 1]);
-	}
-	
-		z[M - 1] = y[M - 1];
+__constant__  float Kgmax = 5.52f;
+__constant__  float Kgmin = 2.996f;
+__constant__  float K = 100.f;
+__constant__  int P1 = 4;
+__constant__  int P2 = 7;
+__constant__  float B = 4.7874f;
 
-	for (int i = M - 2; i > -1; i--){
-		z[i] = y[i] - c[i] * z[i + 1];
+// maturity
+__constant__  float TT = 3.f;
+__constant__  float delta_T = 3.f / 1000;
 
-	}
+__constant__  float delta_X = (5.52f - 2.996f) / 50;
 
+// prefixed dates correspond to maturity T = 3
+__constant__  float T[M] = { 0.03, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8, 2.1, 2.4, 2.7 };
+
+// we create the necessary arrays
+__device__  bool is_synchronized[L];
+__device__  int synchro_count[L];
+__device__  float As[M*(N - 1)];
+__device__  float Bs[M*N];
+__device__  float Cs[M*(N - 1)];
+__device__  float Ys[M*N];
+__device__ float Zs[M*N];
+
+
+// auxiliary functions
+float Maxc(float X, float Y) {
+	return X < Y ? Y : X;
 }
 
-double* extract_udiag(double ** matrix, int M){
-
-	double *arr = (double*)malloc((M - 1) * sizeof(double));
-	for (int i = 1; i < M; i++){
-		arr[i - 1] = matrix[i][i - 1]; 
-	}
-	return arr;
+__device__ float Max(float X, float Y) {
+	return X < Y ? Y : X;
 }
 
-double* extract_diag(double ** matrix, int M){
-
-	double *arr = (double*)malloc((M) * sizeof(double));
-	for (int i = 0; i < M; i++){
-		arr[i] = matrix[i][i]; 
-	}
-	return arr;
+__device__ bool equal(float x, float y) {
+	return abs(x - y) < err_r;
 }
 
-double* extract_adiag(double ** matrix, int M){
-
-	double *arr = (double*)malloc((M - 1) * sizeof(double));
-	for (int i = 1; i < M; i++){
-		arr[i - 1] = matrix[i - 1][i]; 
-	}
-	return arr;
+// r_g : we do not implement!
+__device__ float get_rgc() {
+	return 0.f;
 }
 
+// returns between which two moments from {T[0], ... , T[M - 1]} tStep is
+__device__ int which_slot(int tStep) {
+	float t = tStep * delta_T;
+	int slot = M;
+	for (int i = M-1; i >= 0; i--) {
+		if (t < T[i]) {
+			slot = i;
+		}
+	}
+	return slot ;
+}
 
-int main()
-{
-	std::ifstream inFile;
-	inFile.open("C:/Users/Sergey/Documents/visual studio 2012/Projects/trial-cuda/systems.txt");
-	int N;
-	int M;
-
-	inFile >> N; // number of systems
-	double ***Systems = (double***)malloc(N * sizeof(double**));
-	int *lengths = (int*)malloc(N * sizeof(int));
-	double **Solutions = (double**)malloc(N * sizeof(double*)); 
-
-
-	for(int i = 0; i < N; i++){
-		inFile >> M;
-
-		lengths[i] = M;
-		Systems[i] = (double**)malloc(M * sizeof(double *));
-
-		for (int j = 0; j < M; j++){
-			Systems[i][j] = (double*)malloc(M * sizeof(double));
-			for (int k = 0; k < M; k++){
-				inFile >> Systems[i][j][k];
+// defines the Schema for updation Ys
+__device__ int which_Schema(int tStep) {
+	float t = tStep * delta_T;
+	if (equal(t, T[M - 1])) {
+		return 1;
+	}
+	else {
+		for (int k = 2; k <= M - 1; k++) {
+			if (equal(t, T[M - k])) {
+				return k;
 			}
 		}
+		return 0;// "the normal one" --> no transitions over echeance 
+	}
+}
 
-		Solutions[i] = (double*)malloc(M * sizeof(double));
-		for (int j = 0; j < M; j++){
-			inFile >> Solutions[i][j];
+// indicator function
+__device__ float One_Zero(float S, float B, bool up) {
+	if (up) {
+		return S < B ? 0.f : 1.f;
+	}
+	else {
+		return S < B ? 1.f : 0.f;
+	}
+}
+
+// update Ys by Schema0 (which means E[(S_T - K)_+|S_t])
+__device__ void Update_by_Schema0(int tStep) {
+
+	int idx = threadIdx.x + (blockIdx.x - 1) * N; 
+	int slot = which_slot(tStep);
+	int p_inf = P2 < slot ? P2 : slot;
+	
+	if (blockIdx.x - 1  + (M - slot)   <  P1 || blockIdx.x - 1 > p_inf) {
+		Ys[idx] = 0.0;
+		return;
+	}
+
+	float x = Kgmin + threadIdx.x * delta_X; 
+
+	if (x >= Kgmax - delta_X - err_r) {
+		float pmax = exp(Kgmax) - K;
+		Ys[idx] = -As[idx - 1] * Zs[idx - 1] + (2 - Bs[idx]) * Zs[idx] + (-Cs[idx]) * pmax;
+	}
+	else {
+		if (x <= Kgmin + err_r) {
+			float pmin = 0;
+			Ys[idx] = -As[idx] * pmin + (2 - Bs[idx]) * Zs[idx] + (-Cs[idx + 1]) * Zs[idx + 1];
+		}
+		else {
+			Ys[idx] = -As[idx - 1] * Zs[idx - 1] + (2 - Bs[idx]) * Zs[idx] + (-Cs[idx + 1]) * Zs[idx + 1];
+		}
+
+	}
+	return;
+}
+
+// update Ys by Schema1
+__device__ void Update_by_Schema1(bool up) {
+	int idx = threadIdx.x + (blockIdx.x - 1) * N;
+	float x = Kgmin + threadIdx.x * delta_X;
+
+	if (x >= Kgmax - delta_X - err_r) {
+		// upper boundary
+		float pmax = exp(Kgmax) - K;//M_2
+		// when touches upper boundary, As[idx+1] is set to be As[idx]
+
+		Ys[idx] = -As[idx - 1] * Zs[idx - 1] * One_Zero(x - delta_X, B, up)\
+			+ (2 - Bs[idx]) * Zs[idx] * One_Zero(x, B, up) + \
+			(-Cs[idx]) * pmax * One_Zero(x + delta_X, B, up);
+	}
+	else {
+		if (x <= Kgmin + err_r) {
+			// when touches the lower boundary
+			float pmin = 0;
+
+			Ys[idx] = -As[idx] * pmin * One_Zero(x - delta_X, B, up) + \
+				Zs[idx] * (2 - Bs[idx]) * One_Zero(x, B, up) + \
+				(-Cs[idx + 1]) * Zs[idx + 1] * One_Zero(x + delta_X, B, up);
+		}
+		else {
+			// when it's in the middle
+
+			Ys[idx] = -As[idx - 1] * Zs[idx - 1] * One_Zero(x - delta_X, B, up) + \
+				(2 - Bs[idx]) * Zs[idx] * One_Zero(x, B, up) + \
+				(-Cs[idx + 1]) * Zs[idx + 1] * One_Zero(x + delta_X, B, up);
+		}
+
+	}
+
+	return;
+}
+
+// update Ys by Schema2
+__device__ void Update_by_Schema2(int tStep) {
+
+	// in this case we need interaction between different j's 
+	int idx_this_j = threadIdx.x + (blockIdx.x - 1) * N;
+	int idx_next_j = threadIdx.x + (blockIdx.x) * N;
+
+
+	int slot = which_slot(tStep);
+	int p_inf = P2 < slot ? P2 : slot;
+	
+	if (blockIdx.x - 1 + (M - slot) < P1 || blockIdx.x - 1 > p_inf) {
+		Ys[idx_this_j] = 0.0;
+		return;
+	}
+
+	float x = Kgmin + threadIdx.x * delta_X;
+
+	
+	if (x >= Kgmax - delta_X - err_r) {
+		// upper bound case
+		float pmax = exp(Kgmax) - K;
+
+		Ys[idx_this_j] = -As[idx_this_j - 1] * Zs[idx_this_j - 1] * One_Zero(x - delta_X, B, true) + \
+			(2 - Bs[idx_this_j]) * Zs[idx_this_j] * One_Zero(x, B, true) + \
+			(-Cs[idx_this_j + 1]) * pmax * One_Zero(x + delta_X, B, true) + \
+
+			- As[idx_next_j - 1] * Zs[idx_next_j - 1] * One_Zero(x - delta_X, B, false) + \
+			(2 - Bs[idx_next_j]) * Zs[idx_next_j] * One_Zero(x, B, false) + \
+			(-Cs[idx_next_j + 1]) * pmax * One_Zero(x + delta_X, B, false);
+	}
+
+	else {
+		//lower bound case
+		if (x <= Kgmin + err_r) {
+
+			float pmin = 0;
+
+			Ys[idx_this_j] = -As[idx_this_j - 1] * pmin * One_Zero(x - delta_X, B, true) + \
+				(2 - Bs[idx_this_j]) * Zs[idx_this_j] * One_Zero(x, B, true) + \
+				(-Cs[idx_this_j + 1]) * Zs[idx_this_j + 1] * One_Zero(x + delta_X, B, true) + \
+
+				- As[idx_next_j - 1] * pmin * One_Zero(x - delta_X, B, false) + \
+				(2 - Bs[idx_next_j]) * Zs[idx_next_j] * One_Zero(x, B, false) + \
+				(-Cs[idx_next_j + 1]) * Zs[idx_next_j + 1] * One_Zero(x + delta_X, B, false);
+		}
+
+		else {
+			// general case: "in the middle"
+			Ys[idx_this_j] = -As[idx_this_j - 1] * Zs[idx_this_j - 1] * One_Zero(x - delta_X, B, true) + \
+				(2 - Bs[idx_this_j]) * Zs[idx_this_j] * One_Zero(x, B, true) + \
+				(-Cs[idx_this_j + 1]) * Zs[idx_this_j + 1] * One_Zero(x + delta_X, B, true) + \
+				
+				- As[idx_next_j - 1] * Zs[idx_next_j - 1] * One_Zero(x - delta_X, B, false) + \
+				(2 - Bs[idx_next_j]) * Zs[idx_next_j] * One_Zero(x, B, false) + \
+				(-Cs[idx_next_j + 1]) * Zs[idx_next_j + 1] * One_Zero(x + delta_X, B, false);
 		}
 	}
 
-	inFile.close();
-	int *starts = (int*)malloc(N * sizeof(int));
+	return;
+}
 
-	int count = 0;
-	for (int i = 0; i < N; i++){
-		starts[i] = count;
-		count += lengths[i];
+// this function chooses which schema to use and redirects the task
+// to a X_schema_update function
+__device__ void Update_Ys(int tStep) {
+
+	// Ys is the right part of the recursive equation; 
+	// please notice that: we update first Ys for step i-1 using As, Bs, Cs, at step i, 
+	// then we update As, Bs, Cs for the step i-1; 
+	// by doing that, we don't need to create three extra array to store pd,pm,pd
+	// since they can be calculated from As,Bs,Cs as follows:
+	// *********************************************************************************
+	// As[ threadIdx.x + N*blockIdx.x ] = qd( threadIdx.x*delta_t, threadIdx.x*delta_x)
+	// Bs[ threadIdx.x + N*blockIdx.x ] = qm( threadIdx.x*delta_t, threadIdx.x*delta_x)
+	// Cs[ threadIdx.x + N*blockIdx.x ] = qu( threadIdx.x*delta_t, threadIdx.x*delta_x)
+	// pd = - qd 
+	// pm = 2 - qm
+	// pu = - qu
+
+	int schema = which_Schema(tStep);
+
+	if (schema == 0) {
+		Update_by_Schema0(tStep);
 		
 	}
+	if (schema == 1) {
+		if (blockIdx.x - 1 == P2 || blockIdx.x - 1 == (P1 - 1)) {
+			bool up = true;
+			if (blockIdx.x == (P1 - 1)) {
+				up = false;
+			}
+			Update_by_Schema1(up);
+		}
+		else {
+			Update_by_Schema0(tStep);
+		}
+	}
+	if (schema >= 2) {
+		int Pk = Max(P1 - schema, 0);
+		if (blockIdx.x - 1 == P2 || blockIdx.x - 1 == (Pk - 1)) {
+			bool up = true;
+			if (blockIdx.x - 1 == (Pk - 1)) {
+				up = false;
+			}
+			Update_by_Schema1(up);
+		}
+		else {
 
-	//EXTRACTING DIAGONALS
-	double *As = (double*)malloc((count - N) * sizeof(double));
-	double *Bs = (double*)malloc(count * sizeof(double));
-	double *Cs = (double*)malloc((count - N) * sizeof(double));
-	double *Ys = (double*)malloc(count * sizeof(double));
-	double *Zs = (double*)malloc(count * sizeof(double));
+			Update_by_Schema2(tStep);
+		}
+	}
 
-	double *extract1, *extract2, *extract3;
-	for (int i = 0; i < N; i++){
-		extract1 = extract_udiag(Systems[i], lengths[i]);
-		extract2 = extract_diag(Systems[i], lengths[i]);
-		extract3 = extract_adiag(Systems[i], lengths[i]);
+}
 
-		for (int j = starts[i]; j < starts[i] + lengths[i]; j++){
-			Bs[j] = extract2[j - starts[i]];
-			Ys[j] = Solutions[i][j - starts[i]];
+// updates As
+__device__ void Update_As(int tStep) {
+	int idx = threadIdx.x + (blockIdx.x - 1) * N;
+	if (threadIdx.x < N - 1) {
+		float sigma = 0.2;
+		float miu = get_rgc() - sigma * sigma / 2;
+		As[idx] = -(sigma * sigma * delta_T) / (4 * delta_X * delta_X) - miu * delta_T / (4 * delta_X);
+	}
+}
+
+// updates Bs
+__device__ void Update_Bs(int tStep) {
+	int idx = threadIdx.x + (blockIdx.x - 1) * N;
+	if (threadIdx.x < N) {
+		float sigma = 0.2;
+		Bs[idx] = 1 + (sigma * sigma * delta_T) / (2 * delta_X * delta_X);
+	}
+}
+
+// updates Cs
+__device__ void Update_Cs(int tStep) {
+	int idx = threadIdx.x + (blockIdx.x - 1) * N;
+	if (threadIdx.x < N - 1) { 
+		float sigma = 0.2;
+
+		float miu = get_rgc() - sigma * sigma / 2;
+		Cs[idx] = -(sigma * sigma * delta_T) / (4 * delta_X * delta_X) + miu * delta_T / (4 * delta_X);
+	}
+}
+
+// Tridiagonal systems solver
+__device__ void Thomas_Solver(int tStep) { 
+
+	if (threadIdx.x == 0) {
+		int idx = threadIdx.x + N * (blockIdx.x - 1);		
+		Cs[idx] = Cs[idx] / Bs[idx];
+		Ys[idx] = Ys[idx] / Bs[idx];
+
+		//only the thread 0 of each block solves the system by Thomas, since Thomas is sequential algorithm
+		for (int i = 1; i < N - 1; i++) {
+			Cs[idx + i] = Cs[idx + i] / (Bs[idx + i] - As[idx + i - 1] * Cs[idx + i - 1]);
+		}
+
+		for (int i = 1; i < N; i++) { 
+			Ys[idx + i] = (Ys[idx + i] - As[idx + i - 1] * Ys[idx + i - 1]) / (Bs[idx + i] - As[idx + i - 1] * Cs[idx + i - 1]);
+		}
+
+		Zs[idx + N - 1] = Ys[idx + N - 1];
+
+		for (int i = N - 2; i > -1; i--) {
+			Zs[idx + i] = Ys[idx + i] - Cs[idx + i] * Zs[idx + i + 1];
+		}
+	}
+}
+
+// initializer of Bs, Ys, Zs, As, Cs, is_synchronized, synchro_count
+__device__ void init() {
+
+	int P1c = 4;
+	int P2c = 7;
+	float Kgminc = 20.f;
+	float Kc = 100.f;
+	float delta_Xc = (5.52f - 2.996f) / N;
+
+	for (int i = 0; i < L; i++) {
+		is_synchronized[i] = false;
+	}
+	is_synchronized[L - 1] = true;
+	for (int i = 0; i < L; i++) {
+		synchro_count[i] = 0;
+	}
+	for (int i = 0; i < M*N; i++) {
+		Bs[i] = 0.f;
+		Ys[i] = 0.f;
+	}
+
+	for (int i = 0; i < N; i++) {
+		for (int j = 0; j < M; j++) {
+			if (j < P1c || j > P2c) {
+				Zs[i + j * N] = 0.f;
+			}
+			else {
+				float x = log(Kgminc) + i * delta_Xc;
+				Zs[i + j * N] = exp(x) - Kc > 0 ? exp(x) - Kc : 0.f;
+			}
+		}
+	}
+
+	for (int i = 0; i < M*(N - 1); i++) {
+		As[i] = 0.f;
+		Cs[i] = 0.f;
+	}
+
+	return;
+
+}
+
+// main kernel solves the whole problem
+__global__ void PDE_Solver() { 
+	// block zero is responsible for synchronization for other blocks
+	
+	init(); // we initialize parameters
+	__syncthreads();
+
+	if (blockIdx.x == 0) {
+		// only the first thread in block zero is used, other threads do nothing
+		if (threadIdx.x == 0) {
+
+		// tracking the changes	of Zs	
 			
+			for (int i = L - 1; i >= 0; i--) {
+				
+				// print each 50-th step
+				if ((L - 1 - i) % 50 == 0 )  {
+					printf("step : %d \n\n", L - i - 1);
+					for (int ii = 0; ii < M; ii++) {
+						printf("j = %d: ", ii);
+						for (int jj = 0; jj < N; jj++) {
+						
+							printf("%2.0f ", Zs[jj + N * ii]);
+						}
+						printf("\n");
+					}
+					printf("\n \n");
+				}
+				
+				while (synchro_count[i] != M) {
+					// wait for all other blocks finishing calculation for time step t_i 
+				}
+				// once all other blocks have finished calculation, change the i-1'th synchronization state
+				// allows all other blocks continuing the t_i-1 time step work
+				is_synchronized[i - 1] = true;	
+			}
 		}
+	}
+	else {
 
-		for (int j = starts[i] - i; j < starts[i] + lengths[i] - (i + 1); j++){
-			As[j] = extract1[j - (starts[i] - i)];
-			Cs[j] = extract3[j - (starts[i] - i)];
+		// Only block 1 to M do the work, so that we garantie the sum of sychro_count[i] == M
+		if ((blockIdx.x >= 1) && (blockIdx.x <= M)) {//(blockIdx.x >= 1) && (blockIdx.x < = M)
+		
+		// other blocks are responsible for calculation
+			for (int i = L - 1; i >= 0; i--) {
+				while (is_synchronized[i] != true) {
+					// wait for the time step i's state to be changed to true
+				}
 
+				if (threadIdx.x < N) {
+					Update_Ys(i); // SER_c:
+				}
+				
+				// ATTENTION: all threads in the same block locked by
+				// __syncthreads until all threads arrive here
+
+				__syncthreads();
+				if (threadIdx.x < N) {
+					Update_As(i);
+				}
+				
+				//__syncthreads();
+
+				if (threadIdx.x < N) {
+					Update_Bs(i);
+				}
+				//__syncthreads();
+
+				if (threadIdx.x < N) {
+					Update_Cs(i);
+				}
+				__syncthreads();
+
+				if (threadIdx.x < N) {
+					Thomas_Solver(i);
+				}
+				__syncthreads();
+
+				// only the first thread has the right to write in synchro_count
+				// since all threads in the block ar synchronized, only the first thread writes
+				// can still garantie that all threads in the block have finished the task.
+				if (threadIdx.x == 0) {
+					atomicAdd(&synchro_count[i], 1);
+				}
+			}
 		}
+	}
 
+	// print final result
+	if (blockIdx.x == 0) {
+		if (threadIdx.x == 0)
+		{
+			printf("result: \n");
+			for (int i = 0; i < M; i++) {
+				printf("j = %d: ", i);
+				for (int j = 0; j < N; j++) {
+					printf("%2.1f ", Zs[j + N * i]);
+				}
+				printf("\n");
+			}
+		}
 	}
 	
-	cudaError_t cudaStatus = thomasWithCuda(Zs, As, Bs, Cs, Ys, lengths, starts, N, count);
-	cudaStatus = cudaDeviceReset();
-
-	for (int i = 0; i < N; i++){
-		for (int j = starts[i]; j < starts[i] + lengths[i]; j++)
-			std::cout << Zs[j] << ' ';
-		std::cout << '\n';
-	}
-		
-
-
-	free(As);
-	free(Bs);
-	free(Cs);
-	free(Zs);
-	free(Ys);
-	free(starts);
-	free(Systems);
-	free(lengths);
-	free(Solutions);
-
-
-
-    return 0;
+	
 }
 
-cudaError_t thomasWithCuda(double *Zs, double *As, double *Bs, double *Cs, double *Ys, int *lengths, int *starts,  int N, int size)
-{
-	double *As_c;
-	double *Bs_c;
-	double *Cs_c;
-	double *Zs_c;
-	double *Ys_c;
-	int *lengths_c;
-	int *starts_c;
+int main(int argc, char **argv) {
+
+	// if one needs to output into a file
+	//std::freopen("output.txt", "w", stdout);
+
+	//We need a larger buffer to see the entire output
+	cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 10000000);
+
+	float Tim;							// GPU timer instructions
+	cudaEvent_t start, stop;			// GPU timer instructions
+
+	cudaEventCreate(&start);			// GPU timer instructions
+	cudaEventCreate(&stop);				// GPU timer instructions
+	cudaEventRecord(start, 0);			// GPU timer instructions
+
+	PDE_Solver << <M + 1, N >> > ();
+
+	fflush(stdout);
+	cudaEventRecord(stop, 0);			// GPU timer instructions
+	cudaEventSynchronize(stop);			// GPU timer instructions
+	cudaEventElapsedTime(&Tim,			// GPU timer instructions
+		start, stop);					// GPU timer instructions
+	cudaEventDestroy(start);			// GPU timer instructions
+	cudaEventDestroy(stop);				// GPU timer instructions
 
 
-	cudaError_t cudaStatus;
+	printf("Execution time %f ms\n", Tim);
 
-	cudaStatus = cudaSetDevice(1);
-
-	cudaStatus = cudaMalloc((void**)&As_c, (size - N) * sizeof(double));
-	cudaStatus = cudaMalloc((void**)&Bs_c, size * sizeof(double));
-	cudaStatus = cudaMalloc((void**)&Cs_c, (size - N) * sizeof(double));
-	cudaStatus = cudaMalloc((void**)&Zs_c, size * sizeof(double));
-	cudaStatus = cudaMalloc((void**)&Ys_c, size * sizeof(double));
-	cudaStatus = cudaMalloc((void**)&lengths_c, N * sizeof(int));
-	cudaStatus = cudaMalloc((void**)&starts_c, N * sizeof(int));
-
-
-	cudaStatus = cudaMemcpy(As_c, As, (size - N) * sizeof(double), cudaMemcpyHostToDevice);
-	cudaStatus = cudaMemcpy(Bs_c, Bs, size * sizeof(double), cudaMemcpyHostToDevice);
-	cudaStatus = cudaMemcpy(Cs_c, Cs, (size - N) * sizeof(double), cudaMemcpyHostToDevice);
-	cudaStatus = cudaMemcpy(Ys_c, Ys, size * sizeof(double), cudaMemcpyHostToDevice);
-	cudaStatus = cudaMemcpy(lengths_c, lengths, N * sizeof(int), cudaMemcpyHostToDevice);
-	cudaStatus = cudaMemcpy(starts_c, starts, N * sizeof(int), cudaMemcpyHostToDevice);
-
-	thomasKernel<<<1, N>>>(Zs_c, As_c, Bs_c, Cs_c, Ys_c, lengths_c, starts_c);
-
-	cudaStatus = cudaDeviceSynchronize();
-
-	cudaStatus = cudaMemcpy(Zs, Zs_c, size * sizeof(double), cudaMemcpyDeviceToHost);
-
-	cudaFree(As_c);
-	cudaFree(Bs_c);
-	cudaFree(Cs_c);
-	cudaFree(Zs_c);
-	cudaFree(Ys_c);
-	cudaFree(lengths_c);
-	cudaFree(starts_c);
-
-	return cudaStatus;
+	return 0;
 }
-
